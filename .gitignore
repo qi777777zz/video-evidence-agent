@@ -1,0 +1,7 @@
+.venv/
+.tmp/
+.env
+__pycache__/
+.pytest_cache/
+*.egg-info/
+day1-five-minute.mp4
