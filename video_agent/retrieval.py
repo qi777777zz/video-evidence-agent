@@ -6,12 +6,13 @@ from .config import settings
 
 def terms(text: str) -> set[str]:
     # Character bigrams work for Chinese without a separate tokenizer.
-    clean = re.sub(r"\s+", "", _simplified(text).lower())
+    clean = re.sub(r"\s+", "", simplified(text).lower())
     return {clean[i:i + 2] for i in range(len(clean) - 1)} | set(re.findall(r"[a-z0-9]+", clean))
 
 
 @lru_cache(maxsize=4096)
-def _simplified(text: str) -> str:
+def simplified(text: str) -> str:
+    """Return simplified Chinese for display/search while preserving stored evidence."""
     try:
         return _opencc().convert(text)
     except ImportError:

@@ -8,9 +8,12 @@ class Settings(BaseSettings):
     s3_access_key: str = "minioadmin"
     s3_secret_key: str = "minioadmin"
     s3_bucket: str = "videos"
+    web_origin: str = "http://localhost:8000"
     temporal_address: str = "localhost:7233"
     api_key: str = "demo-key"
     webhook_secret: str = "change-me"
+    webhook_timeout_seconds: float = 10
+    webhook_max_response_bytes: int = 64 * 1024
     model_api_url: str = ""
     model_api_key: str = ""
     model_name: str = ""

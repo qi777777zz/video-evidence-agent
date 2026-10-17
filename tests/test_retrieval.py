@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from video_agent.retrieval import search, terms, verify_evidence
+from video_agent.retrieval import search, simplified, terms, verify_evidence
 
 
 class FakeScalars:
@@ -28,6 +28,10 @@ def test_terms_support_chinese_bigrams_and_ascii_tokens():
     value = terms("并发 Control 123")
     assert "并发" in value
     assert "control123" in value
+
+
+def test_simplified_converts_traditional_chinese_for_display():
+    assert simplified("我們介紹具體的分子運動途徑") == "我们介绍具体的分子运动途径"
 
 
 def test_search_ranks_overlap_then_timestamp():

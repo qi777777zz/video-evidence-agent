@@ -19,3 +19,6 @@ asyncio_mode = "auto"
 
 [tool.setuptools.packages.find]
 include = ["video_agent*", "evaluation*"]
+
+[tool.setuptools.package-data]
+video_agent = ["static/*"]

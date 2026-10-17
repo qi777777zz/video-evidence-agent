@@ -14,6 +14,7 @@ from temporalio.common import RetryPolicy
 from .config import settings
 from .db import Evidence, Session, Video, WebhookEvent
 from . import media, storage
+from .webhooks import UnsafeWebhook, resolve_public_webhook
 
 
 def failure_message(exc: BaseException) -> str:
@@ -145,11 +146,21 @@ async def notify(video_id: str):
         event_id, target, status = event.id, video.webhook_url, video.status
     body = json.dumps({"event_id": event_id, "video_id": video_id, "status": status}, separators=(",", ":"))
     signature = hmac.new(settings.webhook_secret.encode(), body.encode(), hashlib.sha256).hexdigest()
-    async with httpx.AsyncClient(timeout=10) as http:
-        response = await http.post(target, content=body,
+    try:
+        resolve_public_webhook(target)
+    except UnsafeWebhook as exc:
+        raise ValueError(f"unsafe webhook target: {exc}") from exc
+    timeout = httpx.Timeout(settings.webhook_timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as http:
+        async with http.stream("POST", target, content=body,
             headers={"Content-Type": "application/json", "X-Event-Id": event_id,
-                     "X-Signature-SHA256": signature})
-        response.raise_for_status()
+                     "X-Signature-SHA256": signature}) as response:
+            response.raise_for_status()
+            received = 0
+            async for chunk in response.aiter_bytes():
+                received += len(chunk)
+                if received > settings.webhook_max_response_bytes:
+                    raise ValueError("webhook response is too large")
     with Session.begin() as session:
         session.get(WebhookEvent, event_id).status = "delivered"
 

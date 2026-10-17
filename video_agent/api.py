@@ -1,11 +1,15 @@
 import hashlib
-import ipaddress
 import json
+import logging
+import re
+import time
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
+from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -15,7 +19,13 @@ from .agent import answer
 from .config import settings
 from .db import Session, Submission, Upload, Video, init_db
 from . import storage
+from .retrieval import simplified
 from .workflow import VideoWorkflow
+from .webhooks import UnsafeWebhook, resolve_public_webhook
+
+
+logger = logging.getLogger("video_agent.api")
+SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 
 
 def effective_parser_version() -> str:
@@ -31,12 +41,32 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Video Evidence Agent", lifespan=lifespan)
+STATIC_DIR = Path(__file__).with_name("static")
+
+
+@app.middleware("http")
+async def request_trace(request: Request, call_next):
+    supplied_id = request.headers.get("X-Request-Id", "").strip()
+    request_id = supplied_id if SAFE_ID.fullmatch(supplied_id) else str(uuid4())
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(json.dumps({"event": "request_failed", "request_id": request_id,
+            "method": request.method, "path": request.url.path}, separators=(",", ":")))
+        raise
+    duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    response.headers["X-Request-Id"] = request_id
+    logger.info(json.dumps({"event": "request_complete", "request_id": request_id,
+        "method": request.method, "path": request.url.path,
+        "status_code": response.status_code, "duration_ms": duration_ms}, separators=(",", ":")))
+    return response
 
 
 def tenant(x_api_key: str = Header(default=""), x_tenant_id: str = Header(default="demo")):
     if x_api_key != settings.api_key:
         raise HTTPException(401, "invalid API key")
-    if not x_tenant_id or len(x_tenant_id) > 80:
+    if not SAFE_ID.fullmatch(x_tenant_id):
         raise HTTPException(400, "invalid tenant")
     return x_tenant_id
 
@@ -63,15 +93,39 @@ class Question(BaseModel):
 def checked_webhook(value: str | None):
     if value is None:
         return
-    url = urlparse(value)
-    if url.scheme != "https" or not url.hostname or url.username or url.password:
-        raise HTTPException(400, "webhook must be an HTTPS URL")
     try:
-        address = ipaddress.ip_address(url.hostname)
-        if not address.is_global:
-            raise HTTPException(400, "webhook host is not public")
-    except ValueError:
-        pass
+        resolve_public_webhook(value)
+    except UnsafeWebhook as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/health/live", include_in_schema=False)
+def health_live():
+    return {"status": "ok"}
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready():
+    checks = {}
+    try:
+        with Session() as session:
+            session.execute(select(1))
+        checks["database"] = "ok"
+    except Exception:
+        checks["database"] = "unavailable"
+    try:
+        storage.client().head_bucket(Bucket=settings.s3_bucket)
+        checks["object_storage"] = "ok"
+    except Exception:
+        checks["object_storage"] = "unavailable"
+    try:
+        healthy = await app.state.temporal.service_client.check_health()
+        checks["workflow"] = "ok" if healthy else "unavailable"
+    except Exception:
+        checks["workflow"] = "unavailable"
+    if any(value != "ok" for value in checks.values()):
+        raise HTTPException(503, detail={"status": "not_ready", "checks": checks})
+    return {"status": "ready", "checks": checks}
 
 
 @app.post("/uploads")
@@ -187,5 +241,21 @@ async def ask(video_id: str, request: Question, tenant_id: str = Depends(tenant)
         if video.status != "complete":
             raise HTTPException(409, "video not ready")
         result = await answer(session, video, request.question)
+        result["answer"] = simplified(result["answer"])
+        for citation in result["citations"]:
+            citation["text"] = simplified(citation["text"])
         result["playback_url"] = storage.playback_url(video.object_key)
         return result
+
+
+@app.get("/", include_in_schema=False)
+def workbench():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

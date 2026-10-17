@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>证据台 · Video Evidence Agent</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="masthead">
+    <a class="brand" href="/">证据台 <span>VIDEO EVIDENCE</span></a>
+    <button id="settingsButton" class="quiet-button" type="button">连接设置</button>
+  </header>
+
+  <main>
+    <section class="intro">
+      <p class="eyebrow">课程与会议视频核验</p>
+      <h1>答案必须<br>落在时间线上。</h1>
+      <p class="lede">上传一段视频，提出问题。每个回答都附带可点击、可复看的原始证据。</p>
+    </section>
+
+    <section class="workbench" aria-label="视频证据工作台">
+      <aside class="ingest-panel">
+        <div class="section-title"><span>01</span><h2>准备视频</h2></div>
+        <label id="dropzone" class="dropzone" for="videoFile">
+          <input id="videoFile" type="file" accept="video/mp4,video/webm,video/quicktime">
+          <span class="drop-mark">＋</span>
+          <strong>选择视频</strong>
+          <small>MP4、WebM 或 MOV，支持分片上传</small>
+        </label>
+        <div id="fileSummary" class="file-summary" hidden></div>
+        <button id="uploadButton" class="primary-button" type="button" disabled>上传并解析</button>
+
+        <div class="pipeline" aria-live="polite">
+          <div class="pipeline-head">
+            <span>任务状态</span><strong id="statusLabel">等待视频</strong>
+          </div>
+          <div class="progress-track"><span id="progressBar"></span></div>
+          <p id="statusDetail">选择文件后开始。</p>
+        </div>
+      </aside>
+
+      <div class="evidence-panel">
+        <div class="stage">
+          <video id="player" controls preload="metadata"></video>
+          <div id="emptyPlayer" class="empty-player">
+            <span class="timecode">00:00:00</span>
+            <p>证据会在这里打开</p>
+          </div>
+        </div>
+
+        <div class="question-area">
+          <div class="section-title"><span>02</span><h2>核验内容</h2></div>
+          <form id="questionForm">
+            <label for="question">向这段视频提问</label>
+            <div class="question-row">
+              <input id="question" maxlength="1000" placeholder="例如：讲师如何解释并发控制？" disabled>
+              <button id="askButton" class="ask-button" disabled>查找证据</button>
+            </div>
+          </form>
+          <div id="answerEmpty" class="answer-empty">解析完成后，可以从视频中查找答案。</div>
+          <article id="answerCard" class="answer-card" hidden>
+            <p class="answer-label">基于视频的回答</p>
+            <div id="answerText" class="answer-text"></div>
+            <div id="citations" class="citations"></div>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog">
+    <form id="settingsForm" method="dialog">
+      <div class="dialog-head"><h2>连接设置</h2><button value="cancel" aria-label="关闭">×</button></div>
+      <label>API Key<input id="apiKey" type="password" autocomplete="off" placeholder="仅保存在当前浏览器标签页"></label>
+      <label>租户 ID<input id="tenantId" value="demo" maxlength="80"></label>
+      <p>密钥保存在 sessionStorage，不会写入项目文件。</p>
+      <button class="primary-button" value="default">保存连接</button>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

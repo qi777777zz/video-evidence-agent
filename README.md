@@ -51,6 +51,30 @@ Windows 上若 Docker Desktop 报 `sailor-ingest.sock` 无法访问，先不要�
 
 评测输出 Recall@5、MRR、平均时间 IoU、拒答准确率和证据支持率。`evaluation/day3_questions.jsonl` 是当前物理验收视频的开发集；生产阈值仍需使用不同来源的封存测试集确认。
 
+### 第四天：证据播放器演示
+
+启动 API 后访问 `http://localhost:8000/`。在“连接设置”中填写 `.env` 对应的 API Key 和租户 ID；密钥只保存在当前浏览器标签页的 `sessionStorage`，不会写入前端源码。选择视频后，页面会完成 SHA-256 计算、分片直传、任务提交和状态轮询。
+
+解析完成后输入问题。回答下方会以简体中文展示语音或幻灯片证据、时间区间以及 keyword/vector/fused 检索分数；点击证据即可让播放器跳到对应的原片时间。数据库仍保留原始识别文本，刷新页面时，当前标签页会尝试恢复最近的解析任务。
+
+Docker Compose 会根据 `WEB_ORIGIN` 配置 MinIO 的浏览器跨域访问。如果通过其他域名或端口访问演示页，请同步修改 `.env` 中的 `WEB_ORIGIN`，然后重新创建 MinIO 容器。
+
+### 第五天：安全、可靠性与交付验收
+
+服务提供无需鉴权的 `/health/live` 和 `/health/ready`：前者只表示 API 进程存活，后者检查数据库、对象存储和 Temporal，但不返回连接串或密钥。每个 HTTP 响应带 `X-Request-Id`，服务端日志记录请求路径、状态码和耗时，便于关联故障。
+
+Webhook 仅允许标准 443 端口的公开 HTTPS 地址；提交时和实际发送前都会解析全部 DNS 结果，并拒绝私网、回环、链路本地或保留地址。发送端不跟随重定向，同时限制超时及响应体大小。生产环境务必替换 `API_KEY` 和 `WEBHOOK_SECRET`。
+
+启动全部依赖、worker 和 API 后运行最终验收：
+
+```powershell
+.\.venv\Scripts\python scripts\day5_acceptance.py --video sample.mp4 `
+  --speech-question "讲师如何解释并发控制？" `
+  --slide-question "幻灯片列出的课程目标是什么？"
+```
+
+脚本检查健康状态、错误密钥、恶意 Webhook、重复提交幂等性、跨租户隔离、完整解析、两类证据以及无依据拒答，成功后写入 `day5-report.json` 并输出 `DAY5 ACCEPTANCE PASS`。如需验证恢复能力，可在轮询期间重启 worker；Temporal 应从已记录的活动状态继续执行。
+
 ## 外部系统接入
 
 所有请求带 `X-API-Key` 和 `X-Tenant-Id`。先调用 `POST /uploads`，请求 `{"filename":"lecture.mp4","size_bytes":12345}`；按返回的 16 MiB 分片大小，逐片通过 `GET /uploads/{id}/parts/{n}` 获取直传 URL，PUT 到该 URL，记录响应 `ETag`；最后调用 `POST /uploads/{id}/complete`，传入按序的 `[{"PartNumber":1,"ETag":"..."}]`。
