@@ -34,7 +34,7 @@ def audio_segments(path: str) -> list[dict]:
 
     wav = str(Path(path).with_suffix(".wav"))
     run("ffmpeg", "-nostdin", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", wav)
-    model = WhisperModel("small", device="cpu", compute_type="int8")
+    model = WhisperModel(settings.asr_model, device="cpu", compute_type="int8")
     segments, _ = model.transcribe(wav, language="zh", vad_filter=True)
     result = []
     for segment in segments:
@@ -42,7 +42,7 @@ def audio_segments(path: str) -> list[dict]:
         if value:
             result.append({"modality": "speech", "start_ms": round(segment.start * 1000),
                            "end_ms": round(segment.end * 1000), "text": value,
-                           "confidence": None, "raw": {"model": "whisper-small"}})
+                           "confidence": None, "raw": {"model": f"whisper-{settings.asr_model}"}})
     return result
 
 

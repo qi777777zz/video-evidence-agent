@@ -17,7 +17,7 @@ async def answer(session, video, question: str) -> dict:
     # Without a configured model, return an extractive answer with exact evidence.
     if not settings.model_api_url:
         item = candidates[0]
-        return {"answer": item.text, "citations": [citation(item)], "abstained": False,
+        return {"answer": item.text, "citations": [citation(value) for value in candidates], "abstained": False,
                 "trace": ["classify", "retrieve", "verify", "extract"]}
     payload = {"model": settings.model_name, "messages": [
         {"role": "system", "content": "只依据给定证据回答。输出 JSON: answer, citation_ids。无法确认则 answer 为‘无法从视频中确认。’且 citation_ids 为空。"},
@@ -43,5 +43,9 @@ async def answer(session, video, question: str) -> dict:
 
 
 def citation(item):
-    return {"evidence_id": item.id, "modality": item.modality,
-            "start_ms": item.start_ms, "end_ms": item.end_ms, "text": item.text}
+    result = {"evidence_id": item.id, "modality": item.modality,
+              "start_ms": item.start_ms, "end_ms": item.end_ms, "text": item.text}
+    for name in ("keyword_score", "vector_score", "fused_score"):
+        if hasattr(item, name):
+            result[name] = round(getattr(item, name), 4)
+    return result

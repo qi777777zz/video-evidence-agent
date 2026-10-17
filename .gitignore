@@ -1,7 +1,14 @@
-.venv/
+.venv*/
 .tmp/
 .env
 __pycache__/
 .pytest_cache/
 *.egg-info/
 day1-five-minute.mp4
+day2-*.mp4
+day2-*.webm
+day2-report.json
+models/
+evaluation/day3_predictions.jsonl
+191268733/
+load_log

@@ -19,3 +19,7 @@ def test_metrics():
 
 def test_chinese_bigrams():
     assert "并发" in terms("并发控制")
+
+
+def test_terms_normalize_traditional_chinese():
+    assert terms("概率密度") & terms("機率密度")

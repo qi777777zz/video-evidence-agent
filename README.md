@@ -28,6 +28,29 @@ python -m venv .venv
 
 Windows 上若 Docker Desktop 报 `sailor-ingest.sock` 无法访问，先不要点击“Reset to factory defaults”。确认 Docker 进程退出后，检查 `%LOCALAPPDATA%\Docker\run\sailor-ingest.sock`；若该文件连重命名/删除也报“系统无法访问此文件”，属于本机文件系统或重解析点问题，需要修复该路径或重启 Windows 后再启动 Docker。不要删除整个 Docker 数据目录。MinIO 使用 [Chainguard 维护的公开镜像](https://hub.docker.com/r/chainguard/minio)，因为旧的官方 Docker Hub/Quay 地址目前无法匿名拉取。
 
+### 第二天：验收真实解析和证据问答
+
+将 `.env` 中 `PROCESSING_MODE=full`，安装 `.[test,processing]` 后启动依赖、worker 和 API。准备一段同时含中文语音与幻灯片文字的 3–10 分钟视频，然后运行：
+
+```powershell
+.\.venv\Scripts\python scripts\day2_e2e.py --video sample.mp4 `
+  --speech-question "讲师如何解释并发控制？" `
+  --slide-question "幻灯片列出的课程目标是什么？"
+```
+
+脚本验证分片上传、真实 ASR/OCR、任务完成状态、两种模态的合法时间区间、原片播放 URL，以及无依据问题的拒答行为；成功时写入 `day2-report.json` 并输出 `DAY2 E2E PASS`。问题必须与测试视频中的实际内容对应。
+
+### 第三天：中文混合检索与评测
+
+数据库启动后，API/worker 会自动执行可重复迁移，启用 512 维 `pgvector` 字段和 HNSW 余弦索引。中文向量模型默认保存到 D 盘的 `D:/anew/models`。对既有视频重建上下文向量并运行 15 题验收：
+
+```powershell
+.\.venv\Scripts\python scripts\day3_reindex.py --video-id <VIDEO_ID> --force
+.\.venv\Scripts\python scripts\day3_eval.py
+```
+
+评测输出 Recall@5、MRR、平均时间 IoU、拒答准确率和证据支持率。`evaluation/day3_questions.jsonl` 是当前物理验收视频的开发集；生产阈值仍需使用不同来源的封存测试集确认。
+
 ## 外部系统接入
 
 所有请求带 `X-API-Key` 和 `X-Tenant-Id`。先调用 `POST /uploads`，请求 `{"filename":"lecture.mp4","size_bytes":12345}`；按返回的 16 MiB 分片大小，逐片通过 `GET /uploads/{id}/parts/{n}` 获取直传 URL，PUT 到该 URL，记录响应 `ETag`；最后调用 `POST /uploads/{id}/complete`，传入按序的 `[{"PartNumber":1,"ETag":"..."}]`。
@@ -40,6 +63,6 @@ Webhook body 为 `{"event_id":"...","video_id":"...","status":"complete|failed"}
 
 - 文件 SHA-256 在解析前复核；相同租户、哈希和解析版本的已完成视频可复用。幂等键只作用于同租户提交。
 - 语音和 OCR 并行处理，Temporal 保存工作流进度与 Activity 重试状态；`VideoContext` 落在 `evidences` 表中。问答默认返回检索到的原文；设置兼容 Chat Completions 的 `MODEL_API_URL`、`MODEL_API_KEY`、`MODEL_NAME` 后启用生成式回答。
-- 当前检索为轻量中文字符二元组，适合可运行基线；PostgreSQL/pgvector 已在依赖和镜像中预留，向量索引与混合检索仍待实现，不能把当前结果称为混合检索。
+- 检索会先做繁简归一化，再融合字符二元组和 `BAAI/bge-small-zh-v1.5` 向量分数；向量模型或缓存不可用时自动退回关键词检索。引用中返回 keyword/vector/fused 三类分数。
 - 当前租户上限采用超额拒绝；转写/OCR 用 worker 总并发限制。尚未实现公平排队、分支级独立限流、LLM 费用预算与完整浏览器播放器。Webhook 对 DNS 重绑定的防护也需在生产部署前补齐。
-- 评测集不会凭空生成；标注规范与指标脚本在 `evaluation/`。项目效果必须在真实授权样本上实测后报告。
+- 标注规范、开发集与指标脚本在 `evaluation/`。当前开发集来自已验收视频；对外报告效果前仍需增加独立复核和封存测试集。

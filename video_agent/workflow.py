@@ -16,6 +16,17 @@ from .db import Evidence, Session, Video, WebhookEvent
 from . import media, storage
 
 
+def failure_message(exc: BaseException) -> str:
+    """Return the deepest useful Temporal/activity error instead of its wrapper."""
+    current = exc
+    seen = set()
+    while current.__cause__ is not None and id(current.__cause__) not in seen:
+        seen.add(id(current))
+        current = current.__cause__
+    message = str(current).strip() or str(exc).strip() or type(current).__name__
+    return f"{type(current).__name__}: {message}"
+
+
 def state(video_id: str, stage: str, status: str = "running", error: str | None = None):
     with Session.begin() as session:
         video = session.get(Video, video_id)
@@ -73,7 +84,7 @@ def inspect_slides(video_id: str, duration: int) -> list[dict]:
 
 @activity.defn
 def persist(video_id: str, speech: list[dict], slides: list[dict]):
-    state(video_id, "index")
+    state(video_id, "persist")
     with Session.begin() as session:
         video = session.get(Video, video_id)
         existing = session.scalar(select(Evidence.id).where(Evidence.video_id == video_id).limit(1))
@@ -86,7 +97,35 @@ def persist(video_id: str, speech: list[dict], slides: list[dict]):
                 start_ms=row["start_ms"], end_ms=min(row["end_ms"], video.duration_ms),
                 text=row["text"], confidence=row.get("confidence"), raw=row.get("raw", {}),
                 source_key=row.get("source_key"), parser_version=video.parser_version))
+
+
+@activity.defn
+def index_evidence(video_id: str):
+    state(video_id, "embedding")
+    with Session() as session:
+        rows = list(session.scalars(select(Evidence).where(
+            Evidence.video_id == video_id, Evidence.embedding.is_(None))))
+        identifiers = [row.id for row in rows]
+        texts = [row.text for row in rows]
+    status = "indexed"
+    try:
+        from .embeddings import contextual_texts, encode
+        vectors = encode(contextual_texts(rows))
+    except Exception:
+        # Keep lexical retrieval available; the reindex command can retry later.
+        vectors, status = [], "deferred"
+    with Session.begin() as session:
+        for identifier, vector in zip(identifiers, vectors):
+            row = session.get(Evidence, identifier)
+            row.embedding = vector
+            row.embedding_model = settings.embedding_model
+            row.index_status = "indexed"
+        if status == "deferred":
+            for identifier in identifiers:
+                session.get(Evidence, identifier).index_status = "deferred"
+        video = session.get(Video, video_id)
         video.status, video.stage = "complete", "complete"
+    return {"indexed": len(vectors), "deferred": status == "deferred"}
 
 
 @activity.defn
@@ -126,6 +165,8 @@ class VideoWorkflow:
             if mode == "smoke":
                 await workflow.execute_activity(persist, args=[video_id, [], []],
                     start_to_close_timeout=timedelta(minutes=10), retry_policy=retry)
+                await workflow.execute_activity(index_evidence, video_id,
+                    start_to_close_timeout=timedelta(minutes=10), retry_policy=retry)
                 await workflow.execute_activity(notify, video_id,
                     start_to_close_timeout=timedelta(seconds=30), retry_policy=retry)
                 return
@@ -135,8 +176,10 @@ class VideoWorkflow:
                     start_to_close_timeout=timedelta(hours=3), retry_policy=retry))
             await workflow.execute_activity(persist, args=[video_id, speech, slides],
                 start_to_close_timeout=timedelta(minutes=10), retry_policy=retry)
+            await workflow.execute_activity(index_evidence, video_id,
+                start_to_close_timeout=timedelta(minutes=30), retry_policy=retry)
         except Exception as exc:
-            await workflow.execute_activity(fail, args=[video_id, str(exc)],
+            await workflow.execute_activity(fail, args=[video_id, failure_message(exc)],
                 start_to_close_timeout=timedelta(seconds=30), retry_policy=retry)
             raise
         await workflow.execute_activity(notify, video_id,

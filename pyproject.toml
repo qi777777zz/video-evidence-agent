@@ -6,11 +6,11 @@ dependencies = [
   "fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1", "sqlalchemy>=2.0,<3",
   "psycopg[binary]>=3.2,<4", "boto3>=1.35,<2", "temporalio>=1.8,<2",
   "pydantic-settings>=2.5,<3", "httpx>=0.27,<1", "python-multipart>=0.0.9,<1",
-  "imageio-ffmpeg>=0.6,<1",
+  "imageio-ffmpeg>=0.6,<1", "pgvector>=0.3,<1",
 ]
 
 [project.optional-dependencies]
-processing = ["numpy>=2,<3", "Pillow>=10,<12", "rapidocr-onnxruntime>=1.4,<2", "faster-whisper>=1.1,<2"]
+processing = ["numpy>=2,<3", "Pillow>=10,<12", "av>=11,<19", "onnxruntime>=1.20,<1.24", "rapidocr-onnxruntime>=1.4,<2", "faster-whisper>=1.1,<2", "fastembed>=0.7,<1", "opencc-python-reimplemented>=0.1.7,<1"]
 test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2"]
 
 [tool.pytest.ini_options]

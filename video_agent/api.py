@@ -19,7 +19,7 @@ from .workflow import VideoWorkflow
 
 
 def effective_parser_version() -> str:
-    return f"{settings.parser_version}-smoke" if settings.processing_mode == "smoke" else settings.parser_version
+    return settings.pipeline_version()
 
 
 @asynccontextmanager

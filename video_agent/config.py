@@ -22,6 +22,20 @@ class Settings(BaseSettings):
     llm_concurrency: int = 2
     parser_version: str = "v1"
     processing_mode: str = "full"  # smoke validates the upload/workflow path without ML downloads
+    asr_model: str = "small"
+    ocr_model: str = "rapidocr-onnxruntime"
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_dimension: int = 512
+    embedding_cache_dir: str = "D:/anew/models"
+    retrieval_keyword_weight: float = 0.55
+    retrieval_vector_weight: float = 0.45
+    retrieval_vector_threshold: float = 0.58
+
+    def pipeline_version(self) -> str:
+        if self.processing_mode == "smoke":
+            return f"{self.parser_version}-smoke"
+        models = f"asr={self.asr_model};ocr={self.ocr_model};embed={self.embedding_model}"
+        return f"{self.parser_version};{models}"
 
 
 settings = Settings()
