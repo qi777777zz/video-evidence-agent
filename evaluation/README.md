@@ -9,3 +9,5 @@
 运行 `python -m evaluation.metrics evaluation/questions.jsonl evaluation/predictions.jsonl`。预测文件每行包含相同 `video_id`、`question`，以及 `abstained`, `citations`。本脚本计算检索 Recall@5、MRR、时间 IoU、拒答准确率；转写 CER/WER、OCR 字符准确率、人工事实正确率与证据支持率需另由对应标注与人工评审记录。
 
 建议消融：仅语音 / 语音加 OCR；字符检索 / 向量检索 / 混合检索；抽取回答 / 模型直接生成 / 引用验证后生成。每组使用同一封存集，记录模型版本、索引参数、成本和延迟。
+
+封存集应保存在仓库和日常调参环境之外。冻结后记录 SHA-256，并运行 `python evaluation/validate_sealed.py D:\sealed\questions.jsonl --expected-sha256 <HASH>`。校验器默认要求至少 5 个视频和 40 个问题，同时包含有答案与无答案问题。最终报告必须记录数据哈希、代码提交、模型版本和解析版本，不能用开发集冒充封存集。

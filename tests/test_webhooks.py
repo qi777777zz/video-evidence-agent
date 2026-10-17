@@ -2,7 +2,7 @@ import socket
 
 import pytest
 
-from video_agent.webhooks import UnsafeWebhook, resolve_public_webhook
+from video_agent.webhooks import UnsafeWebhook, pinned_webhook_targets, resolve_public_webhook
 
 
 @pytest.mark.parametrize("target", [
@@ -32,3 +32,11 @@ def test_accepts_hostname_with_only_public_answers(monkeypatch):
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
     ])
     assert resolve_public_webhook("https://hooks.example.test/event") == {"93.184.216.34"}
+
+
+def test_pins_connection_to_validated_ip_but_keeps_tls_hostname(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+    ])
+    assert pinned_webhook_targets("https://hooks.example.test/event?q=1") == [
+        ("https://93.184.216.34/event?q=1", "hooks.example.test", "hooks.example.test")]

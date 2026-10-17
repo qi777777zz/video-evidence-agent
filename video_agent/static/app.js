@@ -1,7 +1,8 @@
 const $ = (selector) => document.querySelector(selector);
-const state = { file: null, videoId: sessionStorage.getItem("videoId") || "", timer: null };
+const state = { file: null, videoId: sessionStorage.getItem("videoId") || "", timer: null,
+  uploadId: "", uploadKey: "", uploadController: null, cancelling: false };
 const els = {
-  file: $("#videoFile"), dropzone: $("#dropzone"), fileSummary: $("#fileSummary"), upload: $("#uploadButton"),
+  file: $("#videoFile"), dropzone: $("#dropzone"), fileSummary: $("#fileSummary"), upload: $("#uploadButton"), cancel: $("#cancelUploadButton"),
   status: $("#statusLabel"), detail: $("#statusDetail"), progress: $("#progressBar"), player: $("#player"),
   emptyPlayer: $("#emptyPlayer"), form: $("#questionForm"), question: $("#question"), ask: $("#askButton"),
   answerEmpty: $("#answerEmpty"), answerCard: $("#answerCard"), answer: $("#answerText"), citations: $("#citations"),
@@ -15,8 +16,8 @@ async function api(path, options = {}) {
   const response = await fetch(path, { ...options, headers: { ...credentials(), ...(options.headers || {}) } });
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
-    try { message = (await response.json()).detail || message; } catch (_) { /* response is not JSON */ }
-    throw new Error(message);
+    try { const detail = (await response.json()).detail; message = typeof detail === "string" ? detail : JSON.stringify(detail); } catch (_) { /* response is not JSON */ }
+    const error = new Error(message); error.status = response.status; throw error;
   }
   return response.status === 204 ? null : response.json();
 }
@@ -49,35 +50,83 @@ function chooseFile(file) {
   els.fileSummary.hidden = false;
   els.fileSummary.textContent = `${file.name} · ${formatBytes(file.size)}`;
   els.upload.disabled = false;
-  setProgress(0, "准备就绪", "点击“上传并解析”开始。 ");
+  const saved = loadUpload(file);
+  setProgress(0, saved ? "可恢复上传" : "准备就绪", saved ? "检测到未完成会话，将从已有分片继续。" : "点击“上传并解析”开始。 ");
+}
+function uploadKey(file) {
+  const tenant = sessionStorage.getItem("tenantId") || "demo";
+  return `video-upload:${tenant}:${file.name}:${file.size}:${file.lastModified}`;
+}
+function loadUpload(file) {
+  try { return JSON.parse(localStorage.getItem(uploadKey(file)) || "null"); } catch (_) { return null; }
+}
+function saveUpload(file, value) { localStorage.setItem(uploadKey(file), JSON.stringify(value)); }
+function clearUpload(file) { localStorage.removeItem(uploadKey(file)); }
+async function openUpload(file) {
+  const saved = loadUpload(file);
+  if (saved) {
+    try {
+      const remote = await api(`/uploads/${saved.upload_id}`);
+      if (["open", "completing", "complete"].includes(remote.status) && remote.declared_bytes === file.size) return { ...saved, ...remote };
+      clearUpload(file);
+    } catch (error) {
+      if (![404, 409, 410].includes(error.status)) throw error;
+      clearUpload(file);
+    }
+  }
+  const started = await api("/uploads", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename: file.name, size_bytes: file.size }) });
+  const session = { ...started, parts: [], idempotency_key: crypto.randomUUID() };
+  saveUpload(file, session); return session;
 }
 async function upload() {
   if (!state.file) return;
   if (!sessionStorage.getItem("apiKey")) { els.dialog.showModal(); return; }
   els.upload.disabled = true;
+  els.cancel.hidden = false; state.cancelling = false;
   try {
-    setProgress(3, "正在准备", "创建分片上传任务…");
+    setProgress(3, "正在准备", "检查可恢复的分片上传任务…");
     const hashPromise = sha256(state.file);
-    const started = await api("/uploads", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename: state.file.name, size_bytes: state.file.size }) });
-    const count = Math.ceil(state.file.size / started.part_size), parts = [];
-    for (let number = 1; number <= count; number++) {
+    const started = await openUpload(state.file);
+    state.uploadId = started.upload_id; state.uploadKey = uploadKey(state.file);
+    const count = Math.ceil(state.file.size / started.part_size);
+    const parts = new Map((started.parts || []).map(part => [part.PartNumber, part]));
+    for (let number = 1; started.status === "open" && number <= count; number++) {
+      if (parts.has(number)) {
+        setProgress(5 + 60 * number / count, "正在恢复", `已确认 ${parts.size} / ${count} 个分片`);
+        continue;
+      }
       const signed = await api(`/uploads/${started.upload_id}/parts/${number}`);
       const start = (number - 1) * started.part_size;
-      const response = await fetch(signed.url, { method: "PUT", body: state.file.slice(start, Math.min(start + started.part_size, state.file.size)) });
+      state.uploadController = new AbortController();
+      const response = await fetch(signed.url, { method: "PUT", signal: state.uploadController.signal, body: state.file.slice(start, Math.min(start + started.part_size, state.file.size)) });
       if (!response.ok) throw new Error(`第 ${number} 个分片上传失败`);
       const etag = response.headers.get("ETag");
       if (!etag) throw new Error("对象存储未返回 ETag，请检查 CORS 配置");
-      parts.push({ PartNumber: number, ETag: etag });
+      parts.set(number, { PartNumber: number, ETag: etag });
       setProgress(5 + 60 * number / count, "正在上传", `已上传 ${number} / ${count} 个分片`);
     }
-    await api(`/uploads/${started.upload_id}/complete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ parts }) });
-    const created = await api("/videos", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ upload_id: started.upload_id, sha256: await hashPromise }) });
+    const ordered = [...parts.values()].sort((a, b) => a.PartNumber - b.PartNumber);
+    if (started.status !== "complete") await api(`/uploads/${started.upload_id}/complete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ parts: ordered }) });
+    const created = await api("/videos", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": started.idempotency_key }, body: JSON.stringify({ upload_id: started.upload_id, sha256: await hashPromise }) });
+    clearUpload(state.file); state.uploadId = "";
     state.videoId = created.job_id; sessionStorage.setItem("videoId", state.videoId);
     setProgress(70, "等待解析", "任务已提交，正在读取语音与幻灯片…");
     pollJob();
   } catch (error) {
-    setProgress(0, "执行失败", error.message); els.upload.disabled = false; notify(error.message);
+    if (!state.cancelling) { setProgress(0, "上传已暂停", `${error.message}；再次选择同一文件可继续。`); notify(error.message); }
+    els.upload.disabled = false;
+  } finally {
+    state.uploadController = null; els.cancel.hidden = true;
   }
+}
+async function cancelUpload() {
+  state.cancelling = true; state.uploadController?.abort(); els.cancel.disabled = true;
+  try {
+    if (state.uploadId) await api(`/uploads/${state.uploadId}`, { method: "DELETE" });
+    if (state.file) clearUpload(state.file);
+    state.uploadId = ""; setProgress(0, "上传已取消", "服务器已释放未完成的分片。");
+  } catch (error) { state.cancelling = false; notify(error.message); }
+  finally { els.cancel.disabled = false; els.cancel.hidden = true; els.upload.disabled = false; }
 }
 async function pollJob() {
   window.clearTimeout(state.timer);
@@ -129,7 +178,7 @@ els.file.addEventListener("change", () => chooseFile(els.file.files[0]));
 for (const eventName of ["dragenter", "dragover"]) els.dropzone.addEventListener(eventName, event => { event.preventDefault(); els.dropzone.classList.add("dragging"); });
 for (const eventName of ["dragleave", "drop"]) els.dropzone.addEventListener(eventName, event => { event.preventDefault(); els.dropzone.classList.remove("dragging"); });
 els.dropzone.addEventListener("drop", event => chooseFile(event.dataTransfer.files[0]));
-els.upload.addEventListener("click", upload); els.form.addEventListener("submit", askQuestion);
+els.upload.addEventListener("click", upload); els.cancel.addEventListener("click", cancelUpload); els.form.addEventListener("submit", askQuestion);
 $("#settingsButton").addEventListener("click", () => { els.apiKey.value = sessionStorage.getItem("apiKey") || ""; els.tenant.value = sessionStorage.getItem("tenantId") || "demo"; els.dialog.showModal(); });
 $("#settingsForm").addEventListener("submit", () => { sessionStorage.setItem("apiKey", els.apiKey.value); sessionStorage.setItem("tenantId", els.tenant.value || "demo"); notify("连接设置已保存。"); if (state.videoId) pollJob(); });
 if (state.videoId && sessionStorage.getItem("apiKey")) pollJob();

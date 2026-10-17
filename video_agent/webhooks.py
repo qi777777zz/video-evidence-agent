@@ -1,6 +1,6 @@
 import ipaddress
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 
 class UnsafeWebhook(ValueError):
@@ -35,3 +35,18 @@ def resolve_public_webhook(value: str) -> set[str]:
     if any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise UnsafeWebhook("webhook host must resolve only to public addresses")
     return addresses
+
+
+def pinned_webhook_targets(value: str) -> list[tuple[str, str, str]]:
+    """Return (IP URL, Host header, TLS SNI name) targets after one DNS lookup."""
+    parsed = urlparse(value)
+    addresses = sorted(resolve_public_webhook(value))
+    host = parsed.hostname or ""
+    host_header = host if parsed.port in (None, 443) else f"{host}:{parsed.port}"
+    targets = []
+    for address in addresses:
+        literal = f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
+        netloc = literal if parsed.port in (None, 443) else f"{literal}:{parsed.port}"
+        targets.append((urlunparse((parsed.scheme, netloc, parsed.path or "/",
+                                    parsed.params, parsed.query, "")), host_header, host))
+    return targets

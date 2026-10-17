@@ -19,6 +19,13 @@ def test_workbench_does_not_embed_api_key():
     assert 'sessionStorage.getItem("apiKey")' in combined
 
 
+def test_workbench_supports_resumable_and_cancelled_uploads():
+    script = (Path(__file__).parents[1] / "video_agent" / "static" / "app.js").read_text("utf-8")
+    assert "localStorage.getItem(uploadKey(file))" in script
+    assert "parts.has(number)" in script
+    assert 'method: "DELETE"' in script
+
+
 def test_favicon_exists():
     response = favicon()
     assert response.media_type == "image/svg+xml"

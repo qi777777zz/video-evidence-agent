@@ -1,26 +1,192 @@
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+psycopg://video:${POSTGRES_PASSWORD:-video}@postgres:5432/video
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  S3_BUCKET: ${S3_BUCKET:-videos}
+  TEMPORAL_ADDRESS: temporal:7233
+  REDIS_URL: redis://:${REDIS_PASSWORD:-dev-redis-password}@redis:6379/0
+  APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
+  WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8000}
+  API_KEY: ${API_KEY:-demo-key}
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  METRICS_ALLOWED_NETWORKS: ${METRICS_ALLOWED_NETWORKS:-127.0.0.0/8,::1/128,172.16.0.0/12}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-change-me}
+  PROCESSING_MODE: ${PROCESSING_MODE:-full}
+  MODEL_API_URL: ${MODEL_API_URL:-}
+  MODEL_API_KEY: ${MODEL_API_KEY:-}
+  MODEL_NAME: ${MODEL_NAME:-}
+  EMBEDDING_CACHE_DIR: /models
+  MEDIA_CACHE_DIR: /tmp
+  LIFECYCLE_INTERVAL_SECONDS: ${LIFECYCLE_INTERVAL_SECONDS:-3600}
+  INCOMPLETE_UPLOAD_RETENTION_HOURS: ${INCOMPLETE_UPLOAD_RETENTION_HOURS:-24}
+  FAILED_JOB_RETENTION_DAYS: ${FAILED_JOB_RETENTION_DAYS:-7}
+  ORIGINAL_RETENTION_DAYS: ${ORIGINAL_RETENTION_DAYS:-90}
+  EVIDENCE_RETENTION_DAYS: ${EVIDENCE_RETENTION_DAYS:-90}
+  ORPHAN_OBJECT_GRACE_HOURS: ${ORPHAN_OBJECT_GRACE_HOURS:-24}
+
+x-app-service: &app-service
+  image: video-evidence-agent:${IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: *app-environment
+  env_file: [.env]
+  init: true
+  read_only: true
+  restart: unless-stopped
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  volumes: [model-cache:/models]
+
 services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-dev-redis-password}", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a '$${REDIS_PASSWORD:-dev-redis-password}' ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 320M}
+
   postgres:
     image: pgvector/pgvector:pg16
-    environment: {POSTGRES_DB: video, POSTGRES_USER: video, POSTGRES_PASSWORD: video}
+    environment:
+      POSTGRES_DB: video
+      POSTGRES_USER: video
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-video}
     ports: ["5432:5432"]
+    restart: unless-stopped
+    volumes: [postgres-data:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U video"]
+      test: ["CMD-SHELL", "pg_isready -U video -d video"]
       interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 2G}
+
   minio:
     image: cgr.dev/chainguard/minio:latest
     command: server /data --console-address ':9001'
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_API_CORS_ALLOW_ORIGIN: ${WEB_ORIGIN:-http://localhost:8000}
     ports: ["9000:9000", "9001:9001"]
+    restart: unless-stopped
+    volumes: [minio-data:/data]
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 4G}
+
   temporal:
     image: temporalio/auto-setup:1.27.2
     environment:
       DB: postgres12
       DB_PORT: 5432
       POSTGRES_USER: video
-      POSTGRES_PWD: video
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-video}
       POSTGRES_SEEDS: postgres
-    depends_on: {postgres: {condition: service_healthy}}
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports: ["7233:7233"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "tctl --address localhost:7233 cluster health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 2G}
+
+  minio-init:
+    <<: *app-service
+    command: ["python", "-m", "video_agent.bootstrap"]
+    depends_on:
+      minio:
+        condition: service_started
+    restart: "no"
+
+  db-migrate:
+    <<: *app-service
+    command: ["python", "-c", "from video_agent.db import init_db; init_db()"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app-service
+    command: ["python", "-m", "uvicorn", "video_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["8000:8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 4G}
+
+  worker:
+    <<: *app-service
+    command: ["python", "-m", "video_agent.worker"]
+    expose: ["9091"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      temporal:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits: {cpus: "4", memory: 8G}
+
+  lifecycle:
+    <<: *app-service
+    command: ["python", "-m", "video_agent.lifecycle"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 512M}
+
+volumes:
+  postgres-data:
+  minio-data:
+  model-cache:

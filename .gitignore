@@ -9,6 +9,8 @@ day2-*.mp4
 day2-*.webm
 day2-report.json
 day5-report.json
+day6-performance-report.json
+day7-release-report.json
 [0-9]*.mp4
 models/
 evaluation/day3_predictions.jsonl

@@ -3,18 +3,87 @@ import hashlib
 import hmac
 import json
 import tempfile
+import os
+import threading
+import time
 from datetime import timedelta
+from functools import wraps
 from pathlib import Path
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 
 from .config import settings
 from .db import Evidence, Session, Video, WebhookEvent
 from . import media, storage
-from .webhooks import UnsafeWebhook, resolve_public_webhook
+from .webhooks import UnsafeWebhook, pinned_webhook_targets
+from .telemetry import (PARSER_ATTEMPTS, PARSER_FAILURES, PARSER_RETRIES,
+                        QUEUE_WAIT_SECONDS, STAGE_SECONDS, WEBHOOK_ATTEMPTS)
+
+
+_cache_locks: dict[str, threading.Lock] = {}
+_cache_locks_guard = threading.Lock()
+
+
+def cached_source(video_id: str, key: str) -> str:
+    """Keep a bounded per-worker source cache shared by prepare, ASR, and OCR."""
+    root = Path(settings.media_cache_dir or tempfile.gettempdir()) / "video-agent-media"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{video_id}.mp4"
+    with _cache_locks_guard:
+        lock = _cache_locks.setdefault(video_id, threading.Lock())
+    with lock:
+        if not path.is_file():
+            temporary = root / f".{video_id}-{os.getpid()}-{threading.get_ident()}.part"
+            try:
+                storage.download(key, str(temporary))
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        path.touch()
+        files = sorted((item for item in root.glob("*.mp4") if item != path),
+                       key=lambda item: item.stat().st_mtime)
+        total = sum(item.stat().st_size for item in root.glob("*.mp4"))
+        for item in files:
+            if total <= settings.media_cache_max_bytes:
+                break
+            size = item.stat().st_size
+            try:
+                item.unlink(missing_ok=True)
+            except OSError:
+                continue
+            total -= size
+    return str(path)
+
+
+def instrument_stage(stage: str, parser: str | None = None):
+    """Measure each Activity attempt, including attempts that Temporal retries."""
+    def decorate(function):
+        @wraps(function)
+        def measured(*args, **kwargs):
+            started = time.perf_counter()
+            if parser:
+                PARSER_ATTEMPTS.labels(parser).inc()
+                try:
+                    if activity.info().attempt > 1:
+                        PARSER_RETRIES.labels(parser).inc()
+                except RuntimeError:  # Allows direct unit tests outside an Activity context.
+                    pass
+            try:
+                result = function(*args, **kwargs)
+            except Exception:
+                STAGE_SECONDS.labels(stage, "failure").observe(time.perf_counter() - started)
+                if parser:
+                    PARSER_FAILURES.labels(parser).inc()
+                    if args:
+                        branch_state(args[0], parser, "failed")
+                raise
+            STAGE_SECONDS.labels(stage, "success").observe(time.perf_counter() - started)
+            return result
+        return measured
+    return decorate
 
 
 def failure_message(exc: BaseException) -> str:
@@ -34,56 +103,86 @@ def state(video_id: str, stage: str, status: str = "running", error: str | None 
         video.stage, video.status, video.error = stage, status, error
 
 
+def branch_state(video_id: str, branch: str, status: str) -> None:
+    with Session.begin() as session:
+        video = session.get(Video, video_id)
+        setattr(video, f"{branch}_status", status)
+
+
 @activity.defn
+def acquire_tenant_slot(video_id: str) -> None:
+    """Atomically admit no more than the configured jobs per tenant."""
+    with Session.begin() as session:
+        video = session.get(Video, video_id)
+        if video.status == "running":
+            return
+        session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:tenant, 1))"),
+                        {"tenant": video.tenant_id})
+        active = session.scalar(select(func.count()).select_from(Video).where(
+            Video.tenant_id == video.tenant_id, Video.status == "running", Video.id != video_id))
+        if active >= settings.tenant_concurrency:
+            raise RuntimeError("tenant concurrency slot unavailable")
+        video.status, video.stage, video.error = "running", "admitted", None
+
+
+@activity.defn
+@instrument_stage("prepare")
 def prepare(video_id: str) -> int:
     state(video_id, "prepare")
     with Session() as session:
         video = session.get(Video, video_id)
         key = video.object_key
-    with tempfile.TemporaryDirectory() as folder:
-        path = str(Path(folder) / "source.mp4")
-        storage.download(key, path)
-        with open(path, "rb") as source:
-            digest = hashlib.file_digest(source, "sha256").hexdigest()
-        with Session() as session:
-            expected = session.get(Video, video_id).sha256
-        if digest != expected:
-            raise ValueError("uploaded file hash mismatch")
-        duration = media.duration_ms(path)
+        # utcnow avoids relying on the worker host's local timezone.
+        from .db import utcnow
+        queue_seconds = max(0.0, (utcnow() - video.created_at).total_seconds())
+    QUEUE_WAIT_SECONDS.observe(queue_seconds)
+    path = cached_source(video_id, key)
+    with open(path, "rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    with Session() as session:
+        expected = session.get(Video, video_id).sha256
+    if digest != expected:
+        Path(path).unlink(missing_ok=True)
+        raise ValueError("uploaded file hash mismatch")
+    duration = media.duration_ms(path)
     with Session.begin() as session:
         session.get(Video, video_id).duration_ms = duration
     return duration
 
 
 @activity.defn
+@instrument_stage("asr", "asr")
 def transcribe(video_id: str) -> list[dict]:
-    state(video_id, "transcribe")
+    branch_state(video_id, "asr", "running")
     with Session() as session:
         key = session.get(Video, video_id).object_key
-    with tempfile.TemporaryDirectory() as folder:
-        path = str(Path(folder) / "source.mp4")
-        storage.download(key, path)
-        return media.audio_segments(path)
+    path = cached_source(video_id, key)
+    result = media.audio_segments(path, progress=lambda detail: activity.heartbeat(detail))
+    branch_state(video_id, "asr", "complete")
+    return result
 
 
 @activity.defn
+@instrument_stage("ocr", "ocr")
 def inspect_slides(video_id: str, duration: int) -> list[dict]:
-    state(video_id, "inspect_slides")
+    branch_state(video_id, "ocr", "running")
     with Session() as session:
         key = session.get(Video, video_id).object_key
+    path = cached_source(video_id, key)
     with tempfile.TemporaryDirectory() as folder:
-        path = str(Path(folder) / "source.mp4")
-        storage.download(key, path)
-        result = media.visual_segments(path, duration)
+        result = media.visual_segments(path, duration, frame_dir=folder,
+            progress=lambda detail: activity.heartbeat(detail))
         for row in result:
             frame = row.pop("frame")
             frame_key = f"frames/{video_id}/{row['start_ms']}.jpg"
             storage.upload(frame, frame_key)
             row["source_key"] = frame_key
-        return result
+    branch_state(video_id, "ocr", "complete")
+    return result
 
 
 @activity.defn
+@instrument_stage("persist")
 def persist(video_id: str, speech: list[dict], slides: list[dict]):
     state(video_id, "persist")
     with Session.begin() as session:
@@ -101,6 +200,7 @@ def persist(video_id: str, speech: list[dict], slides: list[dict]):
 
 
 @activity.defn
+@instrument_stage("embedding")
 def index_evidence(video_id: str):
     state(video_id, "embedding")
     with Session() as session:
@@ -146,21 +246,43 @@ async def notify(video_id: str):
         event_id, target, status = event.id, video.webhook_url, video.status
     body = json.dumps({"event_id": event_id, "video_id": video_id, "status": status}, separators=(",", ":"))
     signature = hmac.new(settings.webhook_secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    started = time.perf_counter()
     try:
-        resolve_public_webhook(target)
-    except UnsafeWebhook as exc:
-        raise ValueError(f"unsafe webhook target: {exc}") from exc
-    timeout = httpx.Timeout(settings.webhook_timeout_seconds)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as http:
-        async with http.stream("POST", target, content=body,
-            headers={"Content-Type": "application/json", "X-Event-Id": event_id,
-                     "X-Signature-SHA256": signature}) as response:
-            response.raise_for_status()
-            received = 0
-            async for chunk in response.aiter_bytes():
-                received += len(chunk)
-                if received > settings.webhook_max_response_bytes:
-                    raise ValueError("webhook response is too large")
+        try:
+            targets = pinned_webhook_targets(target)
+        except UnsafeWebhook as exc:
+            raise ValueError(f"unsafe webhook target: {exc}") from exc
+        timeout = httpx.Timeout(settings.webhook_timeout_seconds)
+        last_error = None
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as http:
+            for pinned_url, host_header, sni_hostname in targets:
+                try:
+                    request = http.build_request("POST", pinned_url, content=body,
+                        headers={"Host": host_header, "Content-Type": "application/json",
+                                 "X-Event-Id": event_id, "X-Signature-SHA256": signature})
+                    request.extensions["sni_hostname"] = sni_hostname
+                    response = await http.send(request, stream=True)
+                    try:
+                        response.raise_for_status()
+                        received = 0
+                        async for chunk in response.aiter_bytes():
+                            received += len(chunk)
+                            if received > settings.webhook_max_response_bytes:
+                                raise ValueError("webhook response is too large")
+                    finally:
+                        await response.aclose()
+                    last_error = None
+                    break
+                except (httpx.HTTPError, OSError) as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
+    except Exception:
+        WEBHOOK_ATTEMPTS.labels("failure").inc()
+        STAGE_SECONDS.labels("webhook", "failure").observe(time.perf_counter() - started)
+        raise
+    WEBHOOK_ATTEMPTS.labels("success").inc()
+    STAGE_SECONDS.labels("webhook", "success").observe(time.perf_counter() - started)
     with Session.begin() as session:
         session.get(WebhookEvent, event_id).status = "delivered"
 
@@ -170,7 +292,13 @@ class VideoWorkflow:
     @workflow.run
     async def run(self, video_id: str, mode: str):
         retry = RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=2))
+        resource_controls = workflow.patched("resource-controls-v1")
         try:
+            if resource_controls:
+                await workflow.execute_activity(acquire_tenant_slot, video_id,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=0,
+                        initial_interval=timedelta(seconds=2), maximum_interval=timedelta(seconds=30)))
             duration = await workflow.execute_activity(prepare, video_id,
                 start_to_close_timeout=timedelta(minutes=15), retry_policy=retry)
             if mode == "smoke":
@@ -181,10 +309,16 @@ class VideoWorkflow:
                 await workflow.execute_activity(notify, video_id,
                     start_to_close_timeout=timedelta(seconds=30), retry_policy=retry)
                 return
-            speech, slides = await asyncio.gather(
-                workflow.execute_activity(transcribe, video_id, start_to_close_timeout=timedelta(hours=3), retry_policy=retry),
-                workflow.execute_activity(inspect_slides, args=[video_id, duration],
-                    start_to_close_timeout=timedelta(hours=3), retry_policy=retry))
+            common = {"start_to_close_timeout": timedelta(hours=3), "retry_policy": retry}
+            if resource_controls:
+                speech_call = workflow.execute_activity(transcribe, video_id,
+                    task_queue="video-asr", heartbeat_timeout=timedelta(minutes=2), **common)
+                slides_call = workflow.execute_activity(inspect_slides, args=[video_id, duration],
+                    task_queue="video-ocr", heartbeat_timeout=timedelta(minutes=2), **common)
+            else:
+                speech_call = workflow.execute_activity(transcribe, video_id, **common)
+                slides_call = workflow.execute_activity(inspect_slides, args=[video_id, duration], **common)
+            speech, slides = await asyncio.gather(speech_call, slides_call)
             await workflow.execute_activity(persist, args=[video_id, speech, slides],
                 start_to_close_timeout=timedelta(minutes=10), retry_policy=retry)
             await workflow.execute_activity(index_evidence, video_id,

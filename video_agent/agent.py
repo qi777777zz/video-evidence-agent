@@ -5,12 +5,17 @@ import httpx
 
 from .config import settings
 from .retrieval import search, verify_evidence
+from .telemetry import LLM_REQUESTS
 
 _llm_gate = asyncio.Semaphore(settings.llm_concurrency)
 
 
 async def answer(session, video, question: str) -> dict:
-    candidates = verify_evidence(video, search(session, video.id, question))
+    candidates = verify_evidence(video, search(session, video.id, question))[:settings.max_evidence_count]
+    return await answer_candidates(candidates, question)
+
+
+async def answer_candidates(candidates, question: str) -> dict:
     if not candidates:
         return {"answer": "无法从视频中确认。", "citations": [], "abstained": True,
                 "trace": ["classify", "retrieve", "verify", "abstain"]}
@@ -19,14 +24,14 @@ async def answer(session, video, question: str) -> dict:
         item = candidates[0]
         return {"answer": item.text, "citations": [citation(value) for value in candidates], "abstained": False,
                 "trace": ["classify", "retrieve", "verify", "extract"]}
-    payload = {"model": settings.model_name, "messages": [
+    payload = {"model": settings.model_name, "max_tokens": settings.llm_max_output_tokens, "messages": [
         {"role": "system", "content": "只依据给定证据回答。输出 JSON: answer, citation_ids。无法确认则 answer 为‘无法从视频中确认。’且 citation_ids 为空。"},
         {"role": "user", "content": json.dumps({"question": question, "evidence": [
             {"id": x.id, "text": x.text, "start_ms": x.start_ms, "end_ms": x.end_ms}
             for x in candidates]}, ensure_ascii=False)}], "response_format": {"type": "json_object"}}
     try:
         async with _llm_gate:
-            async with httpx.AsyncClient(timeout=30) as http:
+            async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as http:
                 response = await http.post(settings.model_api_url, json=payload,
                     headers={"Authorization": f"Bearer {settings.model_api_key}"})
                 response.raise_for_status()
@@ -35,9 +40,11 @@ async def answer(session, video, question: str) -> dict:
         cited = [allowed[x] for x in result.get("citation_ids", []) if x in allowed]
         if not cited or not str(result.get("answer", "")).strip():
             raise ValueError("no valid citation")
+        LLM_REQUESTS.labels("success").inc()
         return {"answer": result["answer"], "citations": [citation(x) for x in cited],
                 "abstained": False, "trace": ["classify", "retrieve", "verify", "generate"]}
     except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError):
+        LLM_REQUESTS.labels("failure").inc()
         return {"answer": "无法从视频中确认。", "citations": [], "abstained": True,
                 "trace": ["classify", "retrieve", "verify", "abstain"]}
 

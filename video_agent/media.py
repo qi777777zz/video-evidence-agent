@@ -7,9 +7,26 @@ import imageio_ffmpeg
 from .config import settings
 
 
-def run(*args: str):
+def run(*args: str, progress=None):
     executable = imageio_ffmpeg.get_ffmpeg_exe() if args[0] == "ffmpeg" else args[0]
-    return subprocess.run((executable, *args[1:]), check=True, capture_output=True, text=True, timeout=3600).stdout
+    process = subprocess.Popen((executable, *args[1:]), stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    try:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+                break
+            except subprocess.TimeoutExpired:
+                if progress:
+                    progress("external process running")
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, process.args,
+                                                output=stdout, stderr=stderr)
+        return stdout
+    except BaseException:
+        process.kill()
+        process.communicate()
+        raise
 
 
 def duration_ms(path: str) -> int:
@@ -29,15 +46,18 @@ def duration_ms(path: str) -> int:
     return round(value * 1000)
 
 
-def audio_segments(path: str) -> list[dict]:
+def audio_segments(path: str, progress=None) -> list[dict]:
     from faster_whisper import WhisperModel
 
     wav = str(Path(path).with_suffix(".wav"))
-    run("ffmpeg", "-nostdin", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", wav)
+    run("ffmpeg", "-nostdin", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", wav,
+        progress=progress)
     model = WhisperModel(settings.asr_model, device="cpu", compute_type="int8")
     segments, _ = model.transcribe(wav, language="zh", vad_filter=True)
     result = []
     for segment in segments:
+        if progress:
+            progress({"position_seconds": segment.end})
         value = segment.text.strip()
         if value:
             result.append({"modality": "speech", "start_ms": round(segment.start * 1000),
@@ -46,7 +66,7 @@ def audio_segments(path: str) -> list[dict]:
     return result
 
 
-def visual_segments(path: str, duration: int) -> list[dict]:
+def visual_segments(path: str, duration: int, progress=None, frame_dir: str | None = None) -> list[dict]:
     """Sample every 10 s; de-duplicate near-identical slides and OCR their text."""
     from PIL import Image
     import numpy as np
@@ -56,9 +76,11 @@ def visual_segments(path: str, duration: int) -> list[dict]:
     result = []
     previous = None
     for start in range(0, duration, 10000):
-        frame = str(Path(path).with_name(f"frame-{start}.jpg"))
+        if progress:
+            progress({"position_ms": start, "duration_ms": duration})
+        frame = str(Path(frame_dir or Path(path).parent) / f"frame-{start}.jpg")
         run("ffmpeg", "-nostdin", "-y", "-ss", str(start / 1000), "-i", path,
-            "-frames:v", "1", "-vf", "scale=960:-1", frame)
+            "-frames:v", "1", "-vf", "scale=960:-1", frame, progress=progress)
         image = Image.open(frame).convert("L").resize((32, 32))
         pixels = np.asarray(image, dtype=np.float32)
         delta = float(np.mean(np.abs(pixels - previous))) if previous is not None else 255.0
