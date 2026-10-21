@@ -15,6 +15,13 @@ Compose 会启动 PostgreSQL、MinIO、Temporal、API 和 worker；`minio-init` 
 
 worker 使用独立的 `video-control`、`video-asr` 和 `video-ocr` Temporal 队列，分别落实控制任务、转写和 OCR 的并发上限；升级期间仍监听旧 `video-jobs` 队列，直到升级前的工作流历史处理完毕。长时间解析 Activity 通过 heartbeat 响应 worker 故障和取消请求。
 
+任务业务状态为 `uploaded → validating → processing → ready`，其中 processing 的可见阶段包括
+`transcribing`、`ocr_processing`、`summarizing` 和 `indexing`；异常状态为 `cancelling`、
+`cancelled`、`retrying` 和 `failed`。MySQL 只保存供 API 展示的阶段快照，Temporal 保存执行历史、
+Activity 重试和恢复状态。`GET /jobs/{id}/events` 提供 SSE 进度，`POST /jobs/{id}/cancel`
+请求取消，`POST /jobs/{id}/retry?stage=indexing` 可从指定阶段重新执行。阶段输入版本不变时会复用
+成功产物，Evidence 通过业务键幂等写入。
+
 上传完成使用可恢复的 `completing` 状态：对象存储完成但数据库提交中断时，客户端重试同一请求即可完成对账。worker 在本地维护有大小上限的原片缓存，通常让校验、ASR 与 OCR 共用一次下载；多副本部署时每个实际处理副本仍会各自缓存一份。
 
 设置 `APP_ENVIRONMENT=production` 后，服务会拒绝默认对象存储凭据、默认 Webhook 密钥、无令牌指标端点和未认证 Redis。Compose 的 Redis 使用 `REDIS_PASSWORD`；生产环境还应由编排平台限制 Redis、数据库和 worker 指标端口的网络访问。
@@ -53,7 +60,7 @@ Windows 上若 Docker Desktop 报 `sailor-ingest.sock` 无法访问，先不要�
 
 ### 第三天：中文混合检索与评测
 
-数据库启动后，API/worker 会自动执行可重复迁移，启用 512 维 `pgvector` 字段和 HNSW 余弦索引。中文向量模型默认保存到 D 盘的 `D:/anew/models`。对既有视频重建上下文向量并运行 15 题验收：
+业务数据使用独立 MySQL 8，并由 Alembic 管理 Schema；Temporal 使用其独立 PostgreSQL，绝不与业务表混用。证据向量以 MySQL JSON 保存并在应用层计算余弦相似度。中文向量模型默认保存到 D 盘的 `D:/anew/models`。对既有视频重建上下文向量并运行 15 题验收：
 
 ```powershell
 .\.venv\Scripts\python scripts\day3_reindex.py --video-id <VIDEO_ID> --force
@@ -64,7 +71,7 @@ Windows 上若 Docker Desktop 报 `sailor-ingest.sock` 无法访问，先不要�
 
 ### 第四天：证据播放器演示
 
-启动 API 后访问 `http://localhost:8000/`。在“连接设置”中填写 `.env` 对应的 API Key 和租户 ID；密钥只保存在当前浏览器标签页的 `sessionStorage`，不会写入前端源码。选择视频后，页面会完成 SHA-256 计算、分片直传、任务提交和状态轮询。
+启动 API 后访问 `http://localhost:8000/`。在“连接设置”中填写 `.env` 对应的 API Key 和租户 ID；密钥只保存在当前浏览器标签页的 `sessionStorage`，不会写入前端源码。选择视频后，页面会完成 SHA-256 计算、分片直传、任务提交和状态轮询。问答消息持久化到 MySQL；最近的活跃上下文缓存在 Redis，并在缓存过期或 Redis 暂时不可用时从 MySQL 自动恢复。
 
 解析完成后输入问题。回答下方会以简体中文展示语音或幻灯片证据、时间区间以及 keyword/vector/fused 检索分数；点击证据即可让播放器跳到对应的原片时间。数据库仍保留原始识别文本，刷新页面时，当前标签页会尝试恢复最近的解析任务。
 

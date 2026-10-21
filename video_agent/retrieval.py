@@ -48,13 +48,14 @@ def search(session, video_id: str, query: str, limit: int = 5) -> list:
         try:
             from .embeddings import encode
             query_vector = encode([query], query=True)[0]
-            distance = Evidence.embedding.cosine_distance(query_vector)
-            rows = session.execute(
-                select(Evidence, distance.label("distance"))
-                .where(Evidence.video_id == video_id, Evidence.embedding.is_not(None))
-                .order_by(distance).limit(max(limit * 4, 20))
-            )
-            vector_scores = {item.id: max(0.0, 1.0 - float(value)) for item, value in rows}
+            query_norm = math.sqrt(sum(value * value for value in query_vector)) or 1.0
+            for item in evidence:
+                vector = item.embedding
+                if not vector:
+                    continue
+                norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+                similarity = sum(a * b for a, b in zip(query_vector, vector)) / (query_norm * norm)
+                vector_scores[item.id] = max(0.0, similarity)
         except Exception:
             # Model/cache outages must not take down the question endpoint.
             vector_scores = {}

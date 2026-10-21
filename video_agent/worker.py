@@ -8,7 +8,7 @@ from prometheus_client import start_http_server
 from .config import settings
 from .db import init_db
 from .workflow import (VideoWorkflow, acquire_tenant_slot, fail, index_evidence,
-                       inspect_slides, notify, persist, prepare, transcribe)
+                       inspect_slides, mark_cancelled, notify, persist, prepare, transcribe)
 
 
 async def main():
@@ -19,7 +19,7 @@ async def main():
           ThreadPoolExecutor(max_workers=settings.asr_concurrency) as asr_pool,
           ThreadPoolExecutor(max_workers=settings.ocr_concurrency) as ocr_pool):
         control = Worker(client, task_queue="video-control", workflows=[VideoWorkflow],
-            activities=[acquire_tenant_slot, prepare, persist, index_evidence, notify, fail],
+            activities=[acquire_tenant_slot, prepare, persist, index_evidence, notify, fail, mark_cancelled],
             workflow_runner=UnsandboxedWorkflowRunner(), activity_executor=control_pool,
             max_concurrent_activities=4)
         asr = Worker(client, task_queue="video-asr", activities=[transcribe],
@@ -29,7 +29,7 @@ async def main():
         # Keep the previous queue alive while pre-upgrade workflow histories drain.
         legacy = Worker(client, task_queue="video-jobs", workflows=[VideoWorkflow],
             activities=[acquire_tenant_slot, prepare, transcribe, inspect_slides, persist,
-                        index_evidence, notify, fail],
+                        index_evidence, notify, fail, mark_cancelled],
             workflow_runner=UnsandboxedWorkflowRunner(), activity_executor=control_pool,
             max_concurrent_activities=4)
         await asyncio.gather(control.run(), asr.run(), ocr.run(), legacy.run())

@@ -12,11 +12,14 @@ from pathlib import Path
 
 import httpx
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError, CancelledError
 
 from .config import settings
-from .db import Evidence, Session, Video, WebhookEvent
+from .db import Evidence, Session, StageExecution, Video, WebhookEvent
+from .job_state import stage_snapshot, successful_stage, transition
 from . import media, storage
 from .webhooks import UnsafeWebhook, pinned_webhook_targets
 from .telemetry import (PARSER_ATTEMPTS, PARSER_FAILURES, PARSER_RETRIES,
@@ -79,6 +82,17 @@ def instrument_stage(stage: str, parser: str | None = None):
                     PARSER_FAILURES.labels(parser).inc()
                     if args:
                         branch_state(args[0], parser, "failed")
+                if args:
+                    try:
+                        with Session() as session:
+                            video = session.get(Video, args[0])
+                            public_stage = {"asr": "transcribing", "ocr": "ocr_processing",
+                                            "prepare": "validating", "persist": "summarizing",
+                                            "embedding": "indexing"}.get(stage, stage)
+                            version = _input_version(video, public_stage)
+                        stage_snapshot(args[0], public_stage, version, "failed", error="activity failed")
+                    except Exception:
+                        pass
                 raise
             STAGE_SECONDS.labels(stage, "success").observe(time.perf_counter() - started)
             return result
@@ -100,7 +114,34 @@ def failure_message(exc: BaseException) -> str:
 def state(video_id: str, stage: str, status: str = "running", error: str | None = None):
     with Session.begin() as session:
         video = session.get(Video, video_id)
-        video.stage, video.status, video.error = stage, status, error
+        # Compatibility mapper for callers while exposing the public state model.
+        public = {"running": "processing", "complete": "ready"}.get(status, status)
+        public_stage = {"prepare": "validating", "persist": "summarizing",
+                        "embedding": "indexing", "complete": "ready"}.get(stage, stage)
+        transition(video, public, stage=public_stage, error=error)
+
+
+def _input_version(video: Video, stage: str) -> str:
+    return hashlib.sha256(f"{video.sha256}:{video.parser_version}:{stage}".encode()).hexdigest()
+
+
+def _stage_start(video_id: str, stage: str) -> tuple[str, StageExecution | None]:
+    with Session() as session:
+        video = session.get(Video, video_id)
+        version = _input_version(video, stage)
+    prior = successful_stage(video_id, stage, version)
+    if prior is None:
+        stage_snapshot(video_id, stage, version, "running", increment_attempt=True)
+    return version, prior
+
+
+def _stage_progress(video_id: str, stage: str, version: str, detail) -> None:
+    progress = detail.get("progress", detail.get("percent", 0)) if isinstance(detail, dict) else 0
+    stage_snapshot(video_id, stage, version, "running", progress=int(progress or 0))
+    with Session.begin() as session:
+        video = session.get(Video, video_id)
+        video.progress = max(video.progress, min(95, int(progress or 0)))
+    activity.heartbeat(detail)
 
 
 def branch_state(video_id: str, branch: str, status: str) -> None:
@@ -114,20 +155,26 @@ def acquire_tenant_slot(video_id: str) -> None:
     """Atomically admit no more than the configured jobs per tenant."""
     with Session.begin() as session:
         video = session.get(Video, video_id)
-        if video.status == "running":
+        if video.status in {"validating", "processing"}:
             return
-        session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:tenant, 1))"),
+        session.execute(text("INSERT IGNORE INTO tenant_locks (tenant_id) VALUES (:tenant)"),
+                        {"tenant": video.tenant_id})
+        session.execute(text("SELECT tenant_id FROM tenant_locks WHERE tenant_id=:tenant FOR UPDATE"),
                         {"tenant": video.tenant_id})
         active = session.scalar(select(func.count()).select_from(Video).where(
-            Video.tenant_id == video.tenant_id, Video.status == "running", Video.id != video_id))
+            Video.tenant_id == video.tenant_id,
+            Video.status.in_(["validating", "processing"]), Video.id != video_id))
         if active >= settings.tenant_concurrency:
             raise RuntimeError("tenant concurrency slot unavailable")
-        video.status, video.stage, video.error = "running", "admitted", None
+        transition(video, "validating", progress=2)
 
 
 @activity.defn
 @instrument_stage("prepare")
 def prepare(video_id: str) -> int:
+    version, prior = _stage_start(video_id, "validating")
+    if prior is not None and prior.output_data:
+        return int(prior.output_data["duration_ms"])
     state(video_id, "prepare")
     with Session() as session:
         video = session.get(Video, video_id)
@@ -143,65 +190,92 @@ def prepare(video_id: str) -> int:
         expected = session.get(Video, video_id).sha256
     if digest != expected:
         Path(path).unlink(missing_ok=True)
-        raise ValueError("uploaded file hash mismatch")
+        raise ApplicationError("uploaded file hash mismatch", non_retryable=True,
+                               type="ValidationError")
     duration = media.duration_ms(path)
     with Session.begin() as session:
         session.get(Video, video_id).duration_ms = duration
+    stage_snapshot(video_id, "validating", version, "succeeded", output_version=version,
+                   output_data={"duration_ms": duration}, progress=100)
     return duration
 
 
 @activity.defn
 @instrument_stage("asr", "asr")
 def transcribe(video_id: str) -> list[dict]:
+    version, prior = _stage_start(video_id, "transcribing")
+    if prior is not None:
+        return list(prior.output_data or [])
+    state(video_id, "transcribing")
     branch_state(video_id, "asr", "running")
     with Session() as session:
         key = session.get(Video, video_id).object_key
     path = cached_source(video_id, key)
-    result = media.audio_segments(path, progress=lambda detail: activity.heartbeat(detail))
+    result = media.audio_segments(path, progress=lambda detail: _stage_progress(
+        video_id, "transcribing", version, detail))
     branch_state(video_id, "asr", "complete")
+    stage_snapshot(video_id, "transcribing", version, "succeeded", output_version=version,
+                   output_data=result, progress=100)
     return result
 
 
 @activity.defn
 @instrument_stage("ocr", "ocr")
 def inspect_slides(video_id: str, duration: int) -> list[dict]:
+    version, prior = _stage_start(video_id, "ocr_processing")
+    if prior is not None:
+        return list(prior.output_data or [])
+    state(video_id, "ocr_processing")
     branch_state(video_id, "ocr", "running")
     with Session() as session:
         key = session.get(Video, video_id).object_key
     path = cached_source(video_id, key)
     with tempfile.TemporaryDirectory() as folder:
         result = media.visual_segments(path, duration, frame_dir=folder,
-            progress=lambda detail: activity.heartbeat(detail))
+            progress=lambda detail: _stage_progress(video_id, "ocr_processing", version, detail))
         for row in result:
             frame = row.pop("frame")
             frame_key = f"frames/{video_id}/{row['start_ms']}.jpg"
             storage.upload(frame, frame_key)
             row["source_key"] = frame_key
     branch_state(video_id, "ocr", "complete")
+    stage_snapshot(video_id, "ocr_processing", version, "succeeded", output_version=version,
+                   output_data=result, progress=100)
     return result
 
 
 @activity.defn
 @instrument_stage("persist")
 def persist(video_id: str, speech: list[dict], slides: list[dict]):
+    version, prior = _stage_start(video_id, "summarizing")
+    if prior is not None:
+        return
     state(video_id, "persist")
     with Session.begin() as session:
         video = session.get(Video, video_id)
-        existing = session.scalar(select(Evidence.id).where(Evidence.video_id == video_id).limit(1))
-        if existing:
-            return
         for row in sorted(speech + slides, key=lambda x: x["start_ms"]):
             if not row["text"] or row["end_ms"] <= row["start_ms"]:
                 continue
-            session.add(Evidence(video_id=video_id, modality=row["modality"],
+            key_data = f'{video_id}:{row["modality"]}:{row["start_ms"]}:{row["end_ms"]}:{version}'
+            business_key = hashlib.sha256(key_data.encode()).hexdigest()
+            if session.scalar(select(Evidence.id).where(Evidence.video_id == video_id,
+                                                        Evidence.business_key == business_key)):
+                continue
+            session.add(Evidence(video_id=video_id, business_key=business_key, modality=row["modality"],
+                evidence_source=row["modality"],
                 start_ms=row["start_ms"], end_ms=min(row["end_ms"], video.duration_ms),
                 text=row["text"], confidence=row.get("confidence"), raw=row.get("raw", {}),
                 source_key=row.get("source_key"), parser_version=video.parser_version))
+    stage_snapshot(video_id, "summarizing", version, "succeeded", output_version=version,
+                   output_data={"count": len(speech) + len(slides)}, progress=100)
 
 
 @activity.defn
 @instrument_stage("embedding")
 def index_evidence(video_id: str):
+    version, prior = _stage_start(video_id, "indexing")
+    if prior is not None:
+        return prior.output_data
     state(video_id, "embedding")
     with Session() as session:
         rows = list(session.scalars(select(Evidence).where(
@@ -225,8 +299,11 @@ def index_evidence(video_id: str):
             for identifier in identifiers:
                 session.get(Evidence, identifier).index_status = "deferred"
         video = session.get(Video, video_id)
-        video.status, video.stage = "complete", "complete"
-    return {"indexed": len(vectors), "deferred": status == "deferred"}
+        transition(video, "ready", progress=100)
+    result = {"indexed": len(vectors), "deferred": status == "deferred"}
+    stage_snapshot(video_id, "indexing", version, "succeeded", output_version=version,
+                   output_data=result, progress=100)
+    return result
 
 
 @activity.defn
@@ -323,6 +400,10 @@ class VideoWorkflow:
                 start_to_close_timeout=timedelta(minutes=10), retry_policy=retry)
             await workflow.execute_activity(index_evidence, video_id,
                 start_to_close_timeout=timedelta(minutes=30), retry_policy=retry)
+        except CancelledError:
+            await workflow.execute_activity(mark_cancelled, video_id,
+                start_to_close_timeout=timedelta(seconds=30), retry_policy=retry)
+            raise
         except Exception as exc:
             await workflow.execute_activity(fail, args=[video_id, failure_message(exc)],
                 start_to_close_timeout=timedelta(seconds=30), retry_policy=retry)
@@ -334,3 +415,12 @@ class VideoWorkflow:
 @activity.defn
 def fail(video_id: str, message: str):
     state(video_id, "failed", "failed", message[:1000])
+
+
+@activity.defn
+def mark_cancelled(video_id: str):
+    with Session.begin() as session:
+        video = session.get(Video, video_id)
+        if video.status != "cancelling":
+            transition(video, "cancelling")
+        transition(video, "cancelled")

@@ -11,7 +11,8 @@ from sqlalchemy import delete, select
 
 from . import storage
 from .config import settings
-from .db import Evidence, Session, Submission, Upload, Video, WebhookEvent, init_db, utcnow
+from .db import (Conversation, Evidence, Message, Session, StageExecution,
+                 Submission, Upload, Video, WebhookEvent, init_db, utcnow)
 
 
 logger = logging.getLogger("video_agent.lifecycle")
@@ -34,7 +35,7 @@ def _video_keys(session, video_id: str) -> list[str]:
         return []
     frames = list(session.scalars(select(Evidence.source_key).where(
         Evidence.video_id == video_id, Evidence.source_key.is_not(None))))
-    return [video.object_key, *frames]
+    return [video.object_key, video.audio_key, *frames]
 
 
 def delete_video_data(video_id: str, tenant_id: str | None = None) -> bool:
@@ -52,7 +53,11 @@ def delete_video_data(video_id: str, tenant_id: str | None = None) -> bool:
             return False
         session.execute(delete(WebhookEvent).where(WebhookEvent.video_id == video_id))
         session.execute(delete(Submission).where(Submission.video_id == video_id))
+        session.execute(delete(StageExecution).where(StageExecution.video_id == video_id))
         session.execute(delete(Evidence).where(Evidence.video_id == video_id))
+        conversation_ids = select(Conversation.id).where(Conversation.video_id == video_id)
+        session.execute(delete(Message).where(Message.conversation_id.in_(conversation_ids)))
+        session.execute(delete(Conversation).where(Conversation.video_id == video_id))
         session.delete(video)
         remaining = session.scalar(select(Video.id).where(Video.object_key == object_key).limit(1))
         if not remaining:
@@ -67,10 +72,10 @@ def cleanup_expired(now=None) -> LifecycleResult:
     with Session() as session:
         stale_uploads = list(session.scalars(select(Upload).where(
             Upload.created_at < upload_cutoff,
-            Upload.status.in_(["open", "complete"]),
+            Upload.status.in_(["open", "paused", "complete"]),
             ~Upload.object_key.in_(select(Video.object_key)))))
     for item in stale_uploads:
-        if item.status == "open":
+        if item.status in {"open", "paused"}:
             try:
                 storage.client().abort_multipart_upload(Bucket=settings.s3_bucket,
                     Key=item.object_key, UploadId=item.multipart_id)
@@ -93,9 +98,9 @@ def cleanup_expired(now=None) -> LifecycleResult:
     with Session() as session:
         expired_ids = list(session.scalars(select(Video.id).where(
             ((Video.status == "failed") & (Video.updated_at < cutoffs["failed"])) |
-            ((Video.status == "complete") & (Video.created_at < cutoffs["evidence"])))))
+            ((Video.status == "ready") & (Video.created_at < cutoffs["evidence"])))))
         original_rows = list(session.execute(select(Video.id, Video.object_key).where(
-            Video.status == "complete", Video.original_deleted_at.is_(None),
+            Video.status == "ready", Video.original_deleted_at.is_(None),
             Video.created_at < cutoffs["original"])))
     for video_id, key in original_rows:
         storage.delete_many([key])
@@ -112,7 +117,7 @@ def cleanup_expired(now=None) -> LifecycleResult:
 
 def _objects():
     paginator = storage.client().get_paginator("list_objects_v2")
-    for prefix in ("originals/", "frames/", "temp/"):
+    for prefix in ("originals/", "frames/", "artifacts/", "temp/"):
         for page in paginator.paginate(Bucket=settings.s3_bucket, Prefix=prefix):
             yield from page.get("Contents", [])
 
@@ -125,7 +130,8 @@ def repair_consistency(now=None) -> LifecycleResult:
             select(Video.object_key, Video.id).where(Video.original_deleted_at.is_(None)))}
         frames = {key: evidence_id for key, evidence_id in session.execute(
             select(Evidence.source_key, Evidence.id).where(Evidence.source_key.is_not(None)))}
-        multipart_ids = set(session.scalars(select(Upload.multipart_id).where(Upload.status == "open")))
+        multipart_ids = set(session.scalars(select(Upload.multipart_id).where(
+            Upload.status.in_(["open", "paused"]))))
     existing = {item["Key"]: item for item in _objects()}
     missing_original_ids = [identifier for key, identifier in originals.items() if key not in existing]
     missing_evidence_ids = [identifier for key, identifier in frames.items() if key not in existing]

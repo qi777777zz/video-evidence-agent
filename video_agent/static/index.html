@@ -1,87 +1,38 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>证据台 · Video Evidence Agent</title>
-  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/app.css">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>证据台 · 视频学习工作台</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <header class="masthead">
-    <a class="brand" href="/">证据台 <span>VIDEO EVIDENCE</span></a>
-    <button id="settingsButton" class="quiet-button" type="button">连接设置</button>
-  </header>
-
-  <main>
-    <section class="intro">
-      <p class="eyebrow">课程与会议视频核验</p>
-      <h1>答案必须<br>落在时间线上。</h1>
-      <p class="lede">上传一段视频，提出问题。每个回答都附带可点击、可复看的原始证据。</p>
-    </section>
-
-    <section class="workbench" aria-label="视频证据工作台">
-      <aside class="ingest-panel">
-        <div class="section-title"><span>01</span><h2>准备视频</h2></div>
-        <label id="dropzone" class="dropzone" for="videoFile">
-          <input id="videoFile" type="file" accept="video/mp4,video/webm,video/quicktime">
-          <span class="drop-mark">＋</span>
-          <strong>选择视频</strong>
-          <small>MP4、WebM 或 MOV，支持分片上传</small>
-        </label>
-        <div id="fileSummary" class="file-summary" hidden></div>
-        <button id="uploadButton" class="primary-button" type="button" disabled>上传并解析</button>
-        <button id="cancelUploadButton" class="cancel-button" type="button" hidden>取消上传</button>
-
-        <div class="pipeline" aria-live="polite">
-          <div class="pipeline-head">
-            <span>任务状态</span><strong id="statusLabel">等待视频</strong>
-          </div>
-          <div class="progress-track"><span id="progressBar"></span></div>
-          <p id="statusDetail">选择文件后开始。</p>
-        </div>
-      </aside>
-
-      <div class="evidence-panel">
-        <div class="stage">
-          <video id="player" controls preload="metadata"></video>
-          <div id="emptyPlayer" class="empty-player">
-            <span class="timecode">00:00:00</span>
-            <p>证据会在这里打开</p>
-          </div>
-        </div>
-
-        <div class="question-area">
-          <div class="section-title"><span>02</span><h2>核验内容</h2></div>
-          <form id="questionForm">
-            <label for="question">向这段视频提问</label>
-            <div class="question-row">
-              <input id="question" maxlength="1000" placeholder="例如：讲师如何解释并发控制？" disabled>
-              <button id="askButton" class="ask-button" disabled>查找证据</button>
-            </div>
-          </form>
-          <div id="answerEmpty" class="answer-empty">解析完成后，可以从视频中查找答案。</div>
-          <article id="answerCard" class="answer-card" hidden>
-            <p class="answer-label">基于视频的回答</p>
-            <div id="answerText" class="answer-text"></div>
-            <div id="citations" class="citations"></div>
-          </article>
-        </div>
+  <header class="masthead"><a class="brand" href="/"><b>证据台</b><span>VIDEO EVIDENCE DESK</span></a><div class="header-actions"><span id="queueStats" class="queue-stats">0 个任务</span><button id="settingsButton" class="quiet-button">连接设置</button></div></header>
+  <main class="shell">
+    <aside class="rail">
+      <section class="import-card">
+        <div class="mode-tabs" role="tablist"><button class="mode-tab active" data-mode="local">本地视频</button><button class="mode-tab" data-mode="url">视频网址</button></div>
+        <div id="localPane"><label id="dropzone" class="dropzone" for="videoFile"><input id="videoFile" type="file" accept="video/*" multiple><span class="drop-mark">＋</span><strong>添加视频</strong><small>多选或拖入文件，最多同时上传 3 个</small></label></div>
+        <form id="urlForm" class="url-pane" hidden><label for="videoUrl">B站或抖音公开链接</label><div class="url-row"><input id="videoUrl" type="url" required placeholder="https://www.bilibili.com/video/…"><button>导入</button></div><small>仅处理你有权使用的公开内容，不保存平台账号或 Cookie。</small></form>
+      </section>
+      <div class="queue-toolbar"><div><b>处理队列</b><span id="queueCount">0</span></div><div><button id="pauseAll">全部暂停</button><button id="retryFailed">重试失败项</button></div></div>
+      <div class="filters"><input id="globalSearch" type="search" placeholder="搜索标题、文字稿或总结"><select id="statusFilter"><option value="">全部状态</option><option value="ready">已完成</option><option value="failed">失败</option><option value="processing">处理中</option></select></div>
+      <div id="taskList" class="task-list" aria-live="polite"><div class="queue-empty">添加视频后，任务会在这里按顺序推进。</div></div>
+      <button id="batchExport" class="batch-button" disabled>导出已选视频</button>
+    </aside>
+    <section class="desk">
+      <div id="deskEmpty" class="desk-empty"><div class="empty-time">00:00:00</div><h1>把一段视频<br>变成可检索的知识。</h1><p>从左侧添加或选择视频。文字、音频、总结和证据都会落在同一条时间线上。</p></div>
+      <div id="workspace" hidden>
+        <header class="video-head"><div><p id="videoMeta" class="eyebrow"></p><h1 id="videoTitle"></h1><div id="videoTags" class="tag-row"></div></div><div class="video-actions"><button id="favoriteButton" aria-label="收藏视频">☆</button><button id="deleteVideo" class="danger-text">删除</button></div></header>
+        <div class="timeline-status"><span id="workStatus">等待处理</span><div><i id="workProgress"></i></div><b id="workPercent">0%</b></div>
+        <div class="player-frame"><video id="player" controls preload="metadata"></video><div id="playerEmpty" class="player-empty">视频准备完成后可播放并跳转到证据时间点</div></div>
+        <nav class="work-tabs" aria-label="视频工具"><button class="work-tab active" data-tab="transcript">文字稿</button><button class="work-tab" data-tab="audio">音频</button><button class="work-tab" data-tab="summary">AI 总结</button><button class="work-tab" data-tab="question">证据问答</button></nav>
+        <section id="transcriptPanel" class="tool-panel"><div class="tool-head"><input id="transcriptSearch" type="search" placeholder="在文字稿中查找"><div><button id="copyTranscript">复制</button><button data-download="txt">TXT</button><button data-download="srt">SRT</button></div></div><div id="transcriptList" class="transcript-list"></div></section>
+        <section id="audioPanel" class="tool-panel" hidden><div class="feature-card"><span class="feature-icon">♫</span><div><h2>随时收听</h2><p id="audioStatus">将当前视频提取为通用 MP3 文件。</p></div><button id="audioButton">生成 MP3</button></div></section>
+        <section id="summaryPanel" class="tool-panel" hidden><div class="tool-head"><p>章节、核心要点与结论均来自当前文字稿。</p><div><button id="copySummary">复制</button><button id="summaryButton">生成总结</button></div></div><div id="summaryContent" class="summary-content"></div></section>
+        <section id="questionPanel" class="tool-panel" hidden><form id="questionForm" class="question-form"><label for="question">向当前视频提问</label><div><input id="question" maxlength="1000" placeholder="例如：讲师如何解释并发控制？"><button id="askButton">查找证据</button></div></form><article id="answerCard" class="answer-card" hidden><div id="answerText"></div><div id="citations" class="citations"></div></article></section>
       </div>
     </section>
   </main>
-
-  <dialog id="settingsDialog">
-    <form id="settingsForm" method="dialog">
-      <div class="dialog-head"><h2>连接设置</h2><button value="cancel" aria-label="关闭">×</button></div>
-      <label>API Key<input id="apiKey" type="password" autocomplete="off" placeholder="仅保存在当前浏览器标签页"></label>
-      <label>租户 ID<input id="tenantId" value="demo" maxlength="80"></label>
-      <p>密钥保存在 sessionStorage，不会写入项目文件。</p>
-      <button class="primary-button" value="default">保存连接</button>
-    </form>
-  </dialog>
-
-  <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/static/app.js"></script>
-</body>
-</html>
+  <dialog id="settingsDialog"><form id="settingsForm" method="dialog"><div class="dialog-head"><h2>连接设置</h2><button value="cancel" aria-label="关闭">×</button></div><label>API Key<input id="apiKey" type="password" autocomplete="off" placeholder="仅保存在当前标签页"></label><label>租户 ID<input id="tenantId" value="demo" maxlength="80"></label><p>密钥仅保存在 sessionStorage。</p><button class="primary-button" value="default">保存连接</button></form></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div><script type="module" src="/static/app.js"></script>
+</body></html>

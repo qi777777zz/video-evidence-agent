@@ -1,5 +1,5 @@
 x-app-environment: &app-environment
-  DATABASE_URL: postgresql+psycopg://video:${POSTGRES_PASSWORD:-video}@postgres:5432/video
+  DATABASE_URL: mysql+pymysql://video:${MYSQL_PASSWORD:-video}@mysql:3306/video?charset=utf8mb4
   S3_ENDPOINT: http://minio:9000
   S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
   S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -53,23 +53,38 @@ services:
       resources:
         limits: {cpus: "0.5", memory: 320M}
 
-  postgres:
-    image: pgvector/pgvector:pg16
+  mysql:
+    image: mysql:8.4
     environment:
-      POSTGRES_DB: video
-      POSTGRES_USER: video
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-video}
-    ports: ["5432:5432"]
+      MYSQL_DATABASE: video
+      MYSQL_USER: video
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-video}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-this-root-password}
+    ports: ["3306:3306"]
     restart: unless-stopped
-    volumes: [postgres-data:/var/lib/postgresql/data]
+    volumes: [mysql-data:/var/lib/mysql]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U video -d video"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
       timeout: 3s
       retries: 20
     deploy:
       resources:
         limits: {cpus: "2", memory: 2G}
+
+  temporal-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: temporal
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:-temporal}
+    restart: unless-stopped
+    volumes: [temporal-postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -d temporal"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   minio:
     image: cgr.dev/chainguard/minio:latest
@@ -90,11 +105,11 @@ services:
     environment:
       DB: postgres12
       DB_PORT: 5432
-      POSTGRES_USER: video
-      POSTGRES_PWD: ${POSTGRES_PASSWORD:-video}
-      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:-temporal}
+      POSTGRES_SEEDS: temporal-postgres
     depends_on:
-      postgres:
+      temporal-postgres:
         condition: service_healthy
     ports: ["7233:7233"]
     restart: unless-stopped
@@ -120,7 +135,7 @@ services:
     <<: *app-service
     command: ["python", "-c", "from video_agent.db import init_db; init_db()"]
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
     restart: "no"
 
@@ -129,7 +144,7 @@ services:
     command: ["python", "-m", "uvicorn", "video_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
     ports: ["8000:8000"]
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
@@ -154,7 +169,7 @@ services:
     command: ["python", "-m", "video_agent.worker"]
     expose: ["9091"]
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
@@ -176,7 +191,7 @@ services:
     <<: *app-service
     command: ["python", "-m", "video_agent.lifecycle"]
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
@@ -186,7 +201,27 @@ services:
       resources:
         limits: {cpus: "0.5", memory: 512M}
 
+  scheduler:
+    <<: *app-service
+    command: ["python", "-m", "video_agent.scheduler"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+      resources:
+        limits: {cpus: "0.5", memory: 512M}
+
 volumes:
-  postgres-data:
+  mysql-data:
+  temporal-postgres-data:
   minio-data:
   model-cache:

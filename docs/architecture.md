@@ -6,7 +6,8 @@
 flowchart LR
     U[浏览器 / API 客户端] -->|分片直传| S[(MinIO)]
     U -->|提交、轮询、问答| A[FastAPI]
-    A --> P[(PostgreSQL + pgvector)]
+    A --> P[(MySQL 8 business database)]
+    T[Temporal] --> TP[(Dedicated PostgreSQL)]
     A -->|启动工作流| T[Temporal]
     T --> W[Python Worker]
     W -->|读取原片| S
@@ -30,7 +31,8 @@ flowchart LR
 | --- | --- | --- |
 | API | FastAPI | 异步接口与类型校验简单；当前限流是单进程内存实现，多副本部署需迁移到 Redis 或网关 |
 | 工作流 | Temporal | 支持活动重试和进度持久化；外部副作用仍须依赖幂等键和 Webhook 事件 ID 去重 |
-| 数据库 | PostgreSQL + pgvector | 事务数据与向量索引共库，适合当前规模；大规模向量检索需重新压测和分片 |
+| 业务数据库 | MySQL 8 | 业务事实数据唯一来源；Alembic 迁移，JSON 向量由应用层计算相似度 |
+| Temporal 数据库 | 独立 PostgreSQL | 仅保存 Temporal 内部状态，不与业务表混用 |
 | 对象存储 | MinIO / S3 API | 分片直传、可替换云对象存储；生产需独立凭据、TLS 和生命周期策略 |
 | 解析 | faster-whisper + RapidOCR | 可本地运行并保留时间信息；准确率受音质、版式和硬件影响 |
 | 检索 | 中文字符二元组 + BGE 向量融合 | 兼顾专有名词与语义召回；阈值应使用独立封存评测集校准 |
