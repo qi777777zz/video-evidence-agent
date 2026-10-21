@@ -5,7 +5,7 @@ import logging
 
 from redis import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from .config import settings
 from .db import ConversationSummary, Message
@@ -52,7 +52,8 @@ class ConversationContextCache:
     def _key(self, conversation_id: str) -> str:
         return f"{settings.conversation_cache_key_prefix}:{conversation_id}"
 
-    def load(self, session, conversation_id: str) -> list[dict]:
+    def load(self, session, conversation_id: str,
+             summary: ConversationSummary | None = None) -> list[dict]:
         key = self._key(conversation_id)
         try:
             cached = self.client.lrange(key, 0, -1)
@@ -63,9 +64,16 @@ class ConversationContextCache:
             logger.warning("conversation cache read failed", exc_info=True)
 
         limit = settings.conversation_context_messages
-        rows = list(session.scalars(select(Message).where(
-            Message.conversation_id == conversation_id
-        ).order_by(Message.created_at.desc(), Message.id.desc()).limit(limit)))
+        statement = select(Message).where(Message.conversation_id == conversation_id)
+        if summary:
+            boundary = session.get(Message, summary.through_message_id)
+            if boundary:
+                statement = statement.where(or_(
+                    Message.created_at > boundary.created_at,
+                    (Message.created_at == boundary.created_at) & (Message.id > boundary.id),
+                ))
+        rows = list(session.scalars(statement.order_by(
+            Message.created_at.desc(), Message.id.desc()).limit(limit)))
         context = [{"role": row.role, "content": row.content} for row in reversed(rows)]
         self.replace(conversation_id, context)
         return context

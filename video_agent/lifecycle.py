@@ -11,7 +11,7 @@ from sqlalchemy import delete, select
 
 from . import storage
 from .config import settings
-from .db import (Conversation, Evidence, Message, Session, StageExecution,
+from .db import (Conversation, ConversationSummary, Evidence, Message, Session, StageExecution,
                  Submission, Upload, Video, WebhookEvent, init_db, utcnow)
 
 
@@ -56,6 +56,8 @@ def delete_video_data(video_id: str, tenant_id: str | None = None) -> bool:
         session.execute(delete(StageExecution).where(StageExecution.video_id == video_id))
         session.execute(delete(Evidence).where(Evidence.video_id == video_id))
         conversation_ids = select(Conversation.id).where(Conversation.video_id == video_id)
+        session.execute(delete(ConversationSummary).where(
+            ConversationSummary.conversation_id.in_(conversation_ids)))
         session.execute(delete(Message).where(Message.conversation_id.in_(conversation_ids)))
         session.execute(delete(Conversation).where(Conversation.video_id == video_id))
         session.delete(video)

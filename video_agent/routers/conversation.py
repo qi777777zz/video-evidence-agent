@@ -5,6 +5,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from .. import storage
 from ..agent import answer_candidates, summarize_history
@@ -45,9 +46,9 @@ async def ask(video_id: str, request: Question,
                                         title=request.question[:255])
             session.add(conversation)
             session.flush()
-        history = conversation_context_cache.load(session, conversation.id)
         stored_summary = conversation_context_cache.load_summary(session, conversation.id)
         summary_text = stored_summary.content if stored_summary else None
+        history = conversation_context_cache.load(session, conversation.id, stored_summary)
         candidates = verify_evidence(video, search(session, video.id, request.question))[
             :settings.max_evidence_count]
         object_key, original_deleted = video.object_key, video.original_deleted_at is not None
@@ -74,9 +75,10 @@ async def ask(video_id: str, request: Question,
             try:
                 new_summary = await summarize_history(summary_text, old)
                 with Session.begin() as session:
-                    rows = list(session.scalars(select(Message).where(
+                    rows = list(reversed(list(session.scalars(select(Message).where(
                         Message.conversation_id == conversation_id
-                    ).order_by(Message.created_at.asc(), Message.id.asc())))
+                    ).order_by(Message.created_at.desc(), Message.id.desc())
+                      .limit(len(complete_history))))))
                     boundary = rows[len(old) - 1]
                     summary_row = session.scalar(select(ConversationSummary).where(
                         ConversationSummary.conversation_id == conversation_id).with_for_update())
@@ -87,7 +89,8 @@ async def ask(video_id: str, request: Question,
                         session.add(ConversationSummary(conversation_id=conversation_id,
                             content=new_summary, through_message_id=boundary.id))
                 conversation_context_cache.replace(conversation_id, recent)
-            except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError):
+            except (httpx.HTTPError, SQLAlchemyError, KeyError, IndexError,
+                    ValueError, json.JSONDecodeError):
                 logger.warning("conversation summarization failed; retaining full context", exc_info=True)
     result["conversation_id"] = conversation_id
     result["playback_url"] = None if original_deleted else storage.playback_url(object_key)

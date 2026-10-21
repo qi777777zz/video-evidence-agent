@@ -14,6 +14,8 @@ depends_on = None
 
 
 def upgrade():
+    if "conversation_summaries" in sa.inspect(op.get_bind()).get_table_names():
+        return
     op.create_table(
         "conversation_summaries",
         sa.Column("id", sa.String(36), primary_key=True),
